@@ -52,52 +52,61 @@ Open **http://localhost:8501** to use the chatbot.
 ```
 mospi-intelligence/
 ├── README.md
-├── Makefile                    # make crawl · make etl · make up
-├── docker-compose.yml          # all services wired together
-├── .env.example                # config template
-├── requirements.txt            # all dependencies
+├── Makefile
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+├── requirements.txt
 │
-├── scraper/                    # Part A — Web Scraper
-│   ├── config.py               # pydantic settings from .env
-│   ├── models.py               # Document · PDFFile · ExtractedTable
-│   ├── db.py                   # SQLite CRUD operations
-│   ├── crawl.py                # Playwright browser scraper + pagination
-│   ├── parse.py                # PDF downloader + text/table extractor
-│   ├── report.py               # run summary printer
-│   └── tests/                  # unit + integration tests
-│
-├── pipeline/                   # Part B — ETL Pipeline
-│   ├── validate.py             # data quality checks
-│   ├── chunker.py              # overlapping text chunker
-│   ├── embedder.py             # SentenceTransformers embeddings
-│   ├── indexer.py              # FAISS index builder
-│   ├── catalog.py              # datasets/catalog.json generator
-│   ├── run.py                  # master pipeline entry point
+├── scraper/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── models.py
+│   ├── db.py
+│   ├── crawl.py
+│   ├── parse.py
+│   ├── report.py
+│   ├── utils.py
 │   └── tests/
+│       ├── __init__.py
+│       ├── test_crawl.py
+│       ├── test_integration.py
+│       └── test_parse.py
 │
-├── rag/                        # Part C — RAG Chatbot
-│   ├── api.py                  # FastAPI: /ask /ingest /health
-│   ├── retriever.py            # FAISS vector search
-│   ├── prompt.py               # LLaMA prompt builder
-│   ├── llm.py                  # Ollama client + streaming
-│   └── ui/app.py               # Streamlit chat interface
+├── pipeline/
+│   ├── __init__.py
+│   ├── catalog.py
+│   ├── chunker.py
+│   ├── embedder.py
+│   ├── indexer.py
+│   ├── run.py
+│   ├── validate.py
+│   └── tests/
+│       ├── __init__.py
+│       ├── test_chunker.py
+│       └── test_validate.py
 │
-├── eval/                       # Quality Evaluation (Stretch Goal)
-│   ├── qa_pairs.json           # 10 test Q&A pairs
-│   ├── run_eval.py             # accuracy measurement script
-│   └── results/eval_report.json
+├── rag/
+│   ├── __init__.py
+│   ├── api.py
+│   ├── llm.py
+│   ├── prompt.py
+│   ├── retriever.py
+│   ├── ui/
+│   │   ├── __init__.py
+│   │   └── app.py
+│   └── tests/
+│       ├── __init__.py
+│       └── test_retriever.py
 │
-├── data/
-│   ├── mospi.db                # SQLite database
-│   ├── raw/pdf/                # downloaded PDFs (if available)
-│   └── processed/              # faiss.index · chunks.pkl · documents.parquet
-│
-├── datasets/
-│   └── catalog.json            # corpus manifest
+├── eval/
+│   ├── __init__.py
+│   ├── qa_pairs.json
+│   └── run_eval.py
 │
 └── infra/
-    ├── Dockerfile.scraper      # includes Playwright + Chromium
     ├── Dockerfile.api
+    ├── Dockerfile.scraper
     └── Dockerfile.ui
 ```
 
