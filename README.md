@@ -126,7 +126,7 @@ mospi-intelligence/
 
 ```bash
 # clone the repo
-git clone <your-repo-url>
+git clone <https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant>
 cd mospi-intelligence
 
 # copy config
