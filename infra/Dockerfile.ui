@@ -1,0 +1,29 @@
+# ================================================================
+# Dockerfile.ui
+# Used by: ui service (Streamlit frontend)
+# ================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="MoSPI Research Bot"
+LABEL description="Streamlit chat UI for MoSPI RAG chatbot"
+
+WORKDIR /app
+
+# install only what Streamlit needs (lighter image)
+RUN pip install --no-cache-dir \
+    streamlit==1.35.0 \
+    requests==2.31.0
+
+# copy only the UI code
+COPY rag/ui/ ./rag/ui/
+
+# expose Streamlit port
+EXPOSE 8501
+
+# disable Streamlit's browser auto-open and telemetry
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+# start Streamlit
+CMD ["streamlit", "run", "rag/ui/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

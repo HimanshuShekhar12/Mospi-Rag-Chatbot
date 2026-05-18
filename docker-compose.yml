@@ -1,0 +1,110 @@
+version: "3.9"
+
+# ================================================================
+# MoSPI Scraper + LLaMA RAG Chatbot — Docker Compose
+# ================================================================
+# Services:
+#   ollama   : local LLaMA model server
+#   scraper  : web scraper + PDF parser (run on demand)
+#   pipeline : ETL + FAISS indexer     (run on demand)
+#   api      : FastAPI backend         (always running)
+#   ui       : Streamlit frontend      (always running)
+#
+# Usage:
+#   docker compose up              # start api + ui + ollama
+#   docker compose run scraper     # run crawl + parse
+#   docker compose run pipeline    # run ETL + indexing
+# ================================================================
+
+services:
+
+  # ── Ollama — local LLaMA model server ──────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mospi_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama   # persist downloaded models
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Scraper — web crawler + PDF parser (on demand) ─────────────
+  scraper:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.scraper
+    container_name: mospi_scraper
+    env_file: .env
+    volumes:
+      - ./data:/app/data             # share data/ with other services
+    depends_on:
+      - ollama
+    command: >
+      sh -c "
+        python -m scraper.crawl &&
+        python -m scraper.parse &&
+        python -m scraper.report
+      "
+    profiles:
+      - scraper                      # only runs with: docker compose --profile scraper up
+
+  # ── Pipeline — ETL + FAISS indexer (on demand) ─────────────────
+  pipeline:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.scraper   # same image as scraper
+    container_name: mospi_pipeline
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./datasets:/app/datasets
+    command: python -m pipeline.run
+    profiles:
+      - pipeline                     # only runs with: docker compose --profile pipeline up
+
+  # ── API — FastAPI backend (always running) ──────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.api
+    container_name: mospi_api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data             # needs access to faiss.index + chunks.pkl
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434   # use docker service name
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ── UI — Streamlit frontend (always running) ────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.ui
+    container_name: mospi_ui
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000      # use docker service name
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ── Volumes ────────────────────────────────────────────────────────
+volumes:
+  ollama_data:    # persists downloaded LLaMA model between restarts

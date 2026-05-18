@@ -1,0 +1,36 @@
+# ================================================================
+# Dockerfile.api
+# Used by: api service (FastAPI + uvicorn)
+# ================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="MoSPI Research Bot"
+LABEL description="FastAPI RAG backend for MoSPI chatbot"
+
+WORKDIR /app
+
+# system dependencies
+RUN apt-get update && apt-get install -y \
+    libpoppler-cpp-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# copy all source packages
+COPY scraper/   ./scraper/
+COPY pipeline/  ./pipeline/
+COPY rag/       ./rag/
+COPY .env.example .env
+
+# create data directories
+RUN mkdir -p data/raw/pdf data/processed datasets
+
+# expose FastAPI port
+EXPOSE 8000
+
+# start the API server
+CMD ["uvicorn", "rag.api:app", "--host", "0.0.0.0", "--port", "8000"]

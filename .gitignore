@@ -1,0 +1,49 @@
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# Data files 
+data/raw/pdf/
+data/processed/faiss.index
+data/processed/chunks.pkl
+data/processed/documents.parquet
+data/mospi.db
+
+# Datasets
+datasets/
+
+# Ollama models (huge)
+ollama_data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Eval results (generated)
+eval/results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test cache
+.pytest_cache/
+.mypy_cache/
+
+# Fix scripts (not needed in repo)
+fix_db.py
+check_db.py
+
+# Temp files
+*.log
+*.tmp

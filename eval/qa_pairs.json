@@ -1,0 +1,52 @@
+[
+  {
+    "question": "What is the GDP growth rate of India for 2023-24?",
+    "expected": "8.2",
+    "source": "GDP Press Release 2024"
+  },
+  {
+    "question": "What does MoSPI stand for?",
+    "expected": "Ministry of Statistics and Programme Implementation",
+    "source": "MoSPI About Page"
+  },
+  {
+    "question": "What is the base year for the current GDP series in India?",
+    "expected": "2011-12",
+    "source": "National Accounts Statistics"
+  },
+  {
+    "question": "What is India's Consumer Price Index?",
+    "expected": "CPI",
+    "source": "CPI Press Release"
+  },
+  {
+    "question": "What does IIP stand for?",
+    "expected": "Index of Industrial Production",
+    "source": "IIP Press Release"
+  },
+  {
+    "question": "What is PLFS?",
+    "expected": "Periodic Labour Force Survey",
+    "source": "PLFS Report"
+  },
+  {
+    "question": "Which organisation releases GDP estimates in India?",
+    "expected": "National Statistical Office",
+    "source": "GDP Press Note"
+  },
+  {
+    "question": "What does NSO stand for?",
+    "expected": "National Statistical Office",
+    "source": "MoSPI Publications"
+  },
+  {
+    "question": "What is the frequency of IIP data releases?",
+    "expected": "monthly",
+    "source": "IIP Press Release"
+  },
+  {
+    "question": "What sectors does IIP cover?",
+    "expected": "mining manufacturing electricity",
+    "source": "IIP Methodology"
+  }
+]
