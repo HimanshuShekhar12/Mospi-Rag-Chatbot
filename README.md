@@ -27,7 +27,7 @@ chatbot using a local LLaMA 3 model.
 
 ```bash
 # 1. Clone and set up
-git clone <https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant>
+git clone https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant
 cd mospi-intelligence
 
 # 2. Configure
@@ -126,7 +126,7 @@ mospi-intelligence/
 
 ```bash
 # clone the repo
-git clone <https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant>
+git clone https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant
 cd mospi-intelligence
 
 # copy config
