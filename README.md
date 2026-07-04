@@ -104,8 +104,8 @@ That's it — no Docker, no Ollama, no browser drivers required.
 
 ```powershell
 # 1. Clone
-git clone https://github.com/HimanshuShekhar12/Mospi-Rag-Chatbot
-cd Mospi-Rag-Chatbot
+git clone https://github.com/HimanshuShekhar12/Mospi-rag-chatbot
+cd Mospi-rag-chatbot
 
 # 2. Create and activate a virtual environment
 python -m venv venv
