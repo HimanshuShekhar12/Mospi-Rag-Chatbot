@@ -26,7 +26,7 @@ from scraper.utils import get_logger
 from pipeline.indexer import index_exists
 from rag.retriever import retriever
 from rag.prompt import build_prompt, format_citations
-from rag.llm import generate, is_ollama_running
+from rag.llm import generate, is_llm_available
 
 logger = get_logger(__name__)
 
@@ -108,7 +108,7 @@ def health_check() -> HealthResponse:
       - index    : True if FAISS index exists on disk
       - n_vectors: number of vectors in the loaded index
     """
-    ollama_ok  = is_ollama_running()
+    ollama_ok  = is_llm_available()
     index_ok   = index_exists()
     n_vectors  = 0
 
@@ -165,13 +165,13 @@ def ask(request: AskRequest) -> AskResponse:
             ),
         )
 
-    # ── Guard: Ollama must be running ──────────────────────────────
-    if not is_ollama_running():
+    # ── Guard: LLM backend must be reachable ───────────────────────
+    if not is_llm_available():
         raise HTTPException(
             status_code=503,
             detail=(
-                "Ollama is not running. "
-                "Start it with: ollama serve"
+                "LLM backend unavailable. "
+                "Set GROQ_API_KEY in .env (https://console.groq.com/keys)."
             ),
         )
 

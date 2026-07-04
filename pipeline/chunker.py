@@ -159,6 +159,13 @@ def chunk_document(
 
     raw_chunks = split_text(full_text, chunk_size, chunk_overlap, min_size)
 
+    # Guarantee a non-empty document always yields at least one chunk, even if
+    # it's shorter than min_size — otherwise short publications would be
+    # silently dropped from the index. (split_text itself still filters small
+    # trailing fragments within a larger document.)
+    if not raw_chunks:
+        raw_chunks = [full_text.strip()]
+
     date_str = (
         doc.date_published.isoformat()
         if doc.date_published

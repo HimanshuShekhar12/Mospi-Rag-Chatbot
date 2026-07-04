@@ -1,264 +1,371 @@
-"""scraper/crawl.py — MoSPI crawler with Playwright text scraping."""
+"""
+scraper/crawl.py
+----------------
+MoSPI publications crawler.
+
+The MoSPI website (mospi.gov.in) is a JavaScript single-page app whose
+publication listing is served by a JSON backend API — plain HTML requests
+only return an empty SPA shell. This crawler talks to that API directly,
+then downloads each publication's PDF and extracts its text with pdfplumber.
+
+Flow:
+  1. fetch_publications()   → page through the real listing API
+  2. parse_publication()    → turn each API item into a Document
+  3. download + extract     → pull the PDF and read its text
+  4. save to SQLite         → documents + files tables (with dedup)
+
+Run:
+    python -m scraper.crawl --max-pages 3
+"""
 
 import argparse
-import time
-from datetime import datetime
-from typing import List, Optional
-from urllib.parse import urljoin
+import hashlib
+import io
+from pathlib import Path
+from typing import List, Optional, Tuple
 
+import pdfplumber
+import requests
 from bs4 import BeautifulSoup
 
 from scraper.config import settings
-from scraper.db import init_db, save_document
-from scraper.models import Document
-from scraper.utils import get_logger, normalize_date, normalize_text
+from scraper.db import init_db, save_document, save_file
+from scraper.models import Document, PDFFile
+from scraper.utils import (
+    RateLimiter,
+    get_logger,
+    is_allowed,
+    make_headers,
+    normalize_category,
+    normalize_date,
+    normalize_text,
+)
 
 logger = get_logger(__name__)
+limiter = RateLimiter()
+
+# ── MoSPI backend API ─────────────────────────────────────────────────────────
+
+SITE_BASE = "https://www.mospi.gov.in"
+PUBLICATIONS_API = f"{SITE_BASE}/api/publications-reports/get-web-publications-report-list"
+
+# Extraction bounds — keep the corpus rich but the run bounded.
+MAX_PDF_MB = 30          # skip PDFs larger than this (avoid 100MB+ reports)
+MAX_PDF_PAGES = 25       # only read the first N pages of each PDF
+MAX_SUMMARY_CHARS = 45_000  # cap stored text per document
 
 
-def fetch_with_playwright(url: str) -> Optional[str]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=settings.scraper_user_agent)
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            time.sleep(3)
-            html = page.content()
-            browser.close()
-            return html
-    except Exception as exc:
-        logger.error("Playwright failed", extra={"url": url, "error": str(exc)})
-        return None
+def _api_headers() -> dict:
+    return {
+        "User-Agent": settings.scraper_user_agent,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": SITE_BASE,
+        "Referer": f"{SITE_BASE}/publications-reports",
+    }
 
 
-def scrape_page_text(url: str) -> Optional[str]:
+def clean_title(raw: Optional[str]) -> str:
+    """Strip the HTML wrapper MoSPI stores titles in (e.g. '<p>Title</p>')."""
+    if not raw:
+        return ""
+    text = BeautifulSoup(raw, "html.parser").get_text(separator=" ")
+    # Titles are single-line — collapse every whitespace run to one space.
+    return " ".join(text.split())
+
+
+# Map subject keywords in a title to a clean category slug.
+_CATEGORY_KEYWORDS = [
+    ("gdp", "gdp"), ("gross domestic", "gdp"), ("national income", "gdp"),
+    ("national account", "gdp"), ("gva", "gdp"),
+    ("consumer price", "cpi"), ("cpi", "cpi"), ("inflation", "cpi"),
+    ("industrial production", "iip"), ("iip", "iip"),
+    ("labour force", "plfs"), ("plfs", "plfs"), ("employment", "plfs"),
+    ("labour", "labour"),
+    ("consumption expenditure", "consumption"), ("hces", "consumption"),
+    ("sustainable development", "sdg"), ("sdg", "sdg"),
+    ("annual survey", "survey"), ("survey", "survey"),
+    ("handbook", "handbook"), ("manual", "handbook"),
+    ("statistical", "statistics"), ("yearbook", "statistics"),
+]
+
+
+def derive_category(title: str) -> str:
+    """Pick a clean category slug from a title's subject keywords."""
+    low = title.lower()
+    for keyword, slug in _CATEGORY_KEYWORDS:
+        if keyword in low:
+            return slug
+    return "publication"
+
+
+def build_pdf_url(path: str) -> str:
+    """Turn a relative API file path into an absolute download URL."""
+    if not path:
+        return ""
+    if path.startswith("http"):
+        return path
+    return f"{SITE_BASE}/{path.lstrip('/')}"
+
+
+# ── Listing API ───────────────────────────────────────────────────────────────
+
+def fetch_publications(
+    page_no: int,
+    page_size: int,
+    session: requests.Session,
+) -> Tuple[List[dict], int]:
     """
-    Use Playwright to visit a MoSPI press release page and
-    extract all visible text content.
+    Fetch one page of publications from the MoSPI listing API.
+
+    Returns:
+        (items, total_pages) — items is the raw list of publication dicts.
+        Returns ([], 0) on any error so the caller can stop gracefully.
     """
+    payload = {
+        "page_no": page_no,
+        "page_size": page_size,
+        "search_term": "",
+        "sort_field": "published_year",
+        "sort_order": "DESC",
+        "from_date": "",
+        "to_date": "",
+        "lang": "en",
+        "data_source": "web",
+    }
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        logger.error("Playwright not installed")
-        return None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=settings.scraper_user_agent)
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            time.sleep(2)
-
-            # dismiss language popup if present
-            try:
-                english_btn = page.locator("text=English")
-                if english_btn.count() > 0:
-                    english_btn.first.click()
-                    time.sleep(1)
-            except Exception:
-                pass
-
-            # extract main content text
-            html = page.content()
-            browser.close()
-
-            soup = BeautifulSoup(html, "html.parser")
-
-            # remove nav, header, footer, scripts
-            for tag in soup(["script", "style", "nav", "header", "footer",
-                             "aside", ".menu", ".navigation"]):
-                tag.decompose()
-
-            # get main content area
-            main = (
-                soup.find("main") or
-                soup.find("article") or
-                soup.find(class_="content") or
-                soup.find(id="content") or
-                soup.find("body")
-            )
-
-            text = normalize_text(main.get_text(separator="\n", strip=True)) if main else ""
-            logger.info("Page text scraped", extra={"url": url, "chars": len(text)})
-            return text if len(text) > 200 else None
-
-    except Exception as exc:
-        logger.error("Playwright scrape failed", extra={"url": url, "error": str(exc)})
-        return None
-
-
-def _get_known_documents() -> List[Document]:
-    """
-    Known MoSPI press release page URLs (not PDFs).
-    Playwright will scrape text directly from these pages.
-    """
-    known = [
-        {"title": "Estimates of GDP Q3 2024-25",
-         "url": "https://mospi.gov.in/press-release/estimates-gdp-q3-2024-25",
-         "date": "2025-02-28", "category": "gdp"},
-        {"title": "First Advance Estimate of National Income 2024-25",
-         "url": "https://mospi.gov.in/press-release/first-advance-estimate-national-income-2024-25",
-         "date": "2025-01-07", "category": "gdp"},
-        {"title": "Index of Industrial Production November 2024",
-         "url": "https://mospi.gov.in/press-release/index-industrial-production-november-2024",
-         "date": "2025-01-10", "category": "iip"},
-        {"title": "Consumer Price Index December 2024",
-         "url": "https://mospi.gov.in/press-release/consumer-price-index-december-2024",
-         "date": "2025-01-13", "category": "cpi"},
-        {"title": "Estimates of GDP Q2 2024-25",
-         "url": "https://mospi.gov.in/press-release/estimates-gdp-q2-2024-25",
-         "date": "2024-11-29", "category": "gdp"},
-        {"title": "GDP Q1 2024-25 Press Note",
-         "url": "https://mospi.gov.in/press-release/estimates-gdp-q1-2024-25",
-         "date": "2024-08-30", "category": "gdp"},
-        {"title": "Consumer Price Index December 2023",
-         "url": "https://mospi.gov.in/press-release/consumer-price-index-december-2023",
-         "date": "2024-01-12", "category": "cpi"},
-        {"title": "Index of Industrial Production November 2023",
-         "url": "https://mospi.gov.in/press-release/index-industrial-production-november-2023",
-         "date": "2024-01-12", "category": "iip"},
-        {"title": "Periodic Labour Force Survey Annual Report 2022-23",
-         "url": "https://mospi.gov.in/press-release/periodic-labour-force-survey-annual-report-2022-23",
-         "date": "2024-10-01", "category": "plfs"},
-        {"title": "Annual Survey of Industries 2021-22",
-         "url": "https://mospi.gov.in/press-release/annual-survey-industries-2021-22",
-         "date": "2024-09-01", "category": "report"},
-    ]
-    docs = []
-    for item in known:
-        try:
-            date_obj = datetime.strptime(item["date"], "%Y-%m-%d")
-        except Exception:
-            date_obj = None
-        doc = Document(
-            url=item["url"],
-            title=item["title"],
-            date_published=date_obj,
-            category=item["category"],
-            file_links=[],   # no PDF links needed
+        limiter.wait()
+        resp = session.post(
+            PUBLICATIONS_API, json=payload, headers=_api_headers(), timeout=30
         )
-        docs.append(doc)
-    return docs
+        resp.raise_for_status()
+        body = resp.json()
+        items = body.get("data", []) or []
+        total_pages = int(body.get("pagination", {}).get("totalPages", 0) or 0)
+        logger.info(
+            "Fetched publications page",
+            extra={"page": page_no, "items": len(items), "total_pages": total_pages},
+        )
+        return items, total_pages
+    except Exception as exc:
+        logger.error(
+            "Failed to fetch publications page",
+            extra={"page": page_no, "error": str(exc)},
+        )
+        return [], 0
 
 
-def scrape_document_texts(documents: List[Document]) -> List[Document]:
+def parse_publication(item: dict) -> Optional[Document]:
     """
-    Visit each document URL with Playwright and scrape text content.
-    Saves scraped text as document summary in DB.
+    Convert one raw API publication item into a Document.
+
+    Only items backed by a downloadable PDF (file_one) are returned — those
+    are the ones we can extract real text from. Metadata-only entries
+    (redirect links, no file) are skipped.
     """
-    from scraper.db import get_connection
+    title = clean_title(item.get("title"))
+    if not title or len(title) <= 3:
+        return None
 
-    for doc in documents:
-        logger.info("Scraping page", extra={"url": doc.url})
-        text = scrape_page_text(doc.url)
-        if text:
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE documents SET summary = ? WHERE url = ?",
-                    (text[:5000], doc.url),
-                )
-            logger.info("Text saved", extra={"url": doc.url, "chars": len(text)})
-        else:
-            logger.warning("No text scraped", extra={"url": doc.url})
-        time.sleep(settings.scraper_delay_seconds)
+    file_one = item.get("file_one") or {}
+    pdf_path = file_one.get("path", "") if isinstance(file_one, dict) else ""
+    if not pdf_path or not pdf_path.lower().endswith(".pdf"):
+        logger.debug("Skipping item without PDF", extra={"title": title[:60]})
+        return None
 
-    return documents
+    pdf_url = build_pdf_url(pdf_path)
+    date_published = normalize_date(item.get("published_year"))
+    category = derive_category(title)
+
+    return Document(
+        url=pdf_url,
+        title=title,
+        date_published=date_published,
+        category=category,
+        file_links=[pdf_url],
+    )
 
 
-def crawl(seed_urls: List[str], max_pages: int) -> dict:
+# ── PDF text extraction ───────────────────────────────────────────────────────
+
+def _compute_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def download_pdf(url: str, session: requests.Session) -> Optional[bytes]:
+    """Download a PDF into memory, skipping oversized or non-PDF responses."""
+    try:
+        limiter.wait()
+        resp = session.get(
+            url, headers=make_headers(), timeout=90, stream=True
+        )
+        resp.raise_for_status()
+
+        size = int(resp.headers.get("Content-Length", 0) or 0)
+        if size and size > MAX_PDF_MB * 1024 * 1024:
+            logger.warning(
+                "Skipping oversized PDF",
+                extra={"url": url, "mb": round(size / 1024 / 1024, 1)},
+            )
+            return None
+
+        data = resp.content
+        if len(data) < 1000:
+            logger.warning("PDF too small — likely not a real PDF", extra={"url": url})
+            return None
+        return data
+    except requests.RequestException as exc:
+        logger.error("PDF download failed", extra={"url": url, "error": str(exc)})
+        return None
+
+
+def extract_pdf_text(data: bytes) -> Tuple[str, int]:
+    """Extract text from the first MAX_PDF_PAGES pages of a PDF byte stream."""
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            total_pages = len(pdf.pages)
+            pages = []
+            for page in pdf.pages[:MAX_PDF_PAGES]:
+                raw = page.extract_text()
+                if raw:
+                    pages.append(normalize_text(raw))
+            text = "\n\n".join(pages)
+        return text, total_pages
+    except Exception as exc:
+        logger.error("PDF text extraction failed", extra={"error": str(exc)})
+        return "", 0
+
+
+def _save_pdf_bytes(data: bytes, title: str) -> Path:
+    """Persist the raw PDF under data/raw/pdf for provenance."""
+    download_dir = Path(settings.pdf_download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+    slug = normalize_category(title)[:60] or "document"
+    path = download_dir / f"{slug}_{_compute_hash(data)[:8]}.pdf"
+    path.write_bytes(data)
+    return path
+
+
+def ingest_document(doc: Document, session: requests.Session) -> str:
+    """
+    Download a document's PDF, extract its text, and persist everything.
+
+    Returns one of: "saved", "skipped" (duplicate), "failed" (no text).
+    """
+    data = download_pdf(doc.url, session)
+    if not data:
+        return "failed"
+
+    text, n_pages = extract_pdf_text(data)
+    if not text or len(text) < 200:
+        logger.warning("No usable text extracted", extra={"url": doc.url})
+        return "failed"
+
+    doc.summary = text[:MAX_SUMMARY_CHARS]
+
+    doc_id = save_document(doc)
+    if not doc_id:
+        return "skipped"  # duplicate (hash already present)
+
+    local_path = _save_pdf_bytes(data, doc.title)
+    save_file(
+        PDFFile(
+            document_id=doc_id,
+            file_url=doc.url,
+            file_path=str(local_path),
+            file_hash=_compute_hash(data),
+            pages=n_pages,
+        )
+    )
+    logger.info(
+        "Document ingested",
+        extra={"title": doc.title[:50], "pages": n_pages, "chars": len(text)},
+    )
+    return "saved"
+
+
+# ── Orchestration ─────────────────────────────────────────────────────────────
+
+def crawl(
+    seed_urls: Optional[List[str]] = None,
+    max_pages: int = settings.scraper_max_pages,
+    page_size: int = 10,
+) -> dict:
+    """
+    Crawl the MoSPI publications API and ingest each publication's PDF.
+
+    Args:
+        seed_urls : accepted for CLI/back-compat; the API endpoint is fixed.
+        max_pages : number of listing pages to fetch (page_size items each).
+        page_size : publications per listing page.
+
+    Returns a summary dict of counts.
+    """
     init_db()
-    all_documents: List[Document] = []
+
+    if not is_allowed(PUBLICATIONS_API):
+        logger.warning("Crawling disallowed by robots.txt", extra={"url": PUBLICATIONS_API})
+        return {"total_fetched": 0, "total_saved": 0, "total_skipped": 0,
+                "total_failed": 0, "pages_crawled": 0}
+
+    total_saved = total_skipped = total_failed = total_fetched = 0
     pages_crawled = 0
 
-    # try API first
-    for page_num in range(min(max_pages, 3)):
-        from scraper.crawl import fetch_mospi_api
-        docs = fetch_mospi_api(page_num)
-        if docs:
-            all_documents.extend(docs)
+    with requests.Session() as session:
+        for page_no in range(1, max_pages + 1):
+            items, total_pages = fetch_publications(page_no, page_size, session)
+            if not items:
+                break
             pages_crawled += 1
-        else:
-            break
 
-    # fall back to known documents
-    if not all_documents:
-        all_documents = _get_known_documents()
-        pages_crawled = 1
+            for item in items:
+                doc = parse_publication(item)
+                if not doc:
+                    continue
+                total_fetched += 1
+                outcome = ingest_document(doc, session)
+                if outcome == "saved":
+                    total_saved += 1
+                elif outcome == "skipped":
+                    total_skipped += 1
+                else:
+                    total_failed += 1
 
-    # save documents to DB
-    total_saved = total_skipped = 0
-    for doc in all_documents:
-        if save_document(doc):
-            total_saved += 1
-        else:
-            total_skipped += 1
-
-    # scrape text from each page using Playwright
-    logger.info("Starting Playwright text scraping")
-    scrape_document_texts(all_documents)
+            if total_pages and page_no >= total_pages:
+                break
 
     summary = {
-        "total_fetched": len(all_documents),
+        "total_fetched": total_fetched,
         "total_saved": total_saved,
         "total_skipped": total_skipped,
+        "total_failed": total_failed,
         "pages_crawled": pages_crawled,
     }
     logger.info("Crawl complete", extra=summary)
     return summary
 
 
-def fetch_mospi_api(page_num: int = 0) -> List[Document]:
-    import requests
-    endpoints = [
-        f"https://mospi.gov.in/api/press-releases?page={page_num}",
-        f"https://mospi.gov.in/press-releases?_format=json&page={page_num}",
-    ]
-    headers = {"User-Agent": settings.scraper_user_agent, "Accept": "application/json"}
-    for endpoint in endpoints:
-        try:
-            time.sleep(settings.scraper_delay_seconds)
-            resp = requests.get(endpoint, headers=headers, timeout=15)
-            if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
-                from scraper.crawl import _parse_json
-                docs = _parse_json(resp.json())
-                if docs:
-                    return docs
-        except Exception:
-            continue
-    return []
-
-
-def _parse_json(data) -> List[Document]:
-    items = data if isinstance(data, list) else data.get("data", data.get("nodes", []))
-    docs = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        title = item.get("title") or item.get("attributes", {}).get("title", "")
-        url   = item.get("url") or item.get("path", "")
-        title = normalize_text(str(title))
-        if url and not url.startswith("http"):
-            url = urljoin("https://mospi.gov.in", url)
-        if title and url:
-            docs.append(Document(url=url, title=title, category="press-release"))
-    return docs
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed-url", nargs="+", default=settings.seed_urls)
+    parser = argparse.ArgumentParser(description="Crawl MoSPI publications and extract PDF text.")
+    parser.add_argument("--seed-url", nargs="+", default=None,
+                        help="Accepted for compatibility; the API endpoint is fixed.")
     parser.add_argument("--max-pages", type=int, default=settings.scraper_max_pages)
+    parser.add_argument("--page-size", type=int, default=10)
     args = parser.parse_args()
-    summary = crawl(seed_urls=args.seed_url, max_pages=args.max_pages)
-    print(f"\n── Crawl Summary ───────────────────────────────")
-    print(f"  Documents found   : {summary['total_fetched']}")
-    print(f"  New (saved)       : {summary['total_saved']}")
-    print(f"  Duplicates skipped: {summary['total_skipped']}")
-    print(f"  Pages crawled     : {summary['pages_crawled']}")
-    print(f"────────────────────────────────────────────────\n")
+
+    summary = crawl(
+        seed_urls=args.seed_url,
+        max_pages=args.max_pages,
+        page_size=args.page_size,
+    )
+
+    print("\n── Crawl Summary ───────────────────────────────")
+    print(f"  Publications found : {summary['total_fetched']}")
+    print(f"  Ingested (saved)   : {summary['total_saved']}")
+    print(f"  Duplicates skipped : {summary['total_skipped']}")
+    print(f"  Failed (no text)   : {summary['total_failed']}")
+    print(f"  Pages crawled      : {summary['pages_crawled']}")
+    print("────────────────────────────────────────────────\n")
 
 
 if __name__ == "__main__":

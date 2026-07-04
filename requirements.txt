@@ -23,7 +23,8 @@ sentence-transformers>=2.7.0
 faiss-cpu>=1.7.4
 
 # RAG / LLM
-ollama>=0.2.0
+groq>=0.11.0        # LLaMA 3 via Groq's free hosted API
+ollama>=0.2.0       # optional: local/offline inference
 
 # API
 fastapi>=0.110.0

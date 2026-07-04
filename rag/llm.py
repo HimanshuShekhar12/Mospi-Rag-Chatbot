@@ -1,56 +1,71 @@
 """
 rag/llm.py
 -----------
-Ollama LLaMA client for the RAG chatbot.
+LLaMA 3 client for the RAG chatbot, served via the Groq API.
 
-Calls the local Ollama server with a chat prompt and returns
-the response — either as a complete string or as a stream of tokens.
+Groq hosts LLaMA 3 Instruct models and exposes them over a fast,
+free-tier HTTP API — so the chatbot runs without a local Ollama
+server or Docker. Set GROQ_API_KEY in .env (get a free key at
+https://console.groq.com/keys).
 
 Assignment requirement:
   "Generator: LLaMA 3 Instruct (via Ollama or llama.cpp)"
   "A toggle for k and temperature"
 """
 
-import os
-from typing import Generator, List, Optional
+from typing import Generator, List
 
-import ollama
-from ollama import Client, ResponseError
+from groq import Groq, GroqError
 
 from scraper.config import settings
 from scraper.utils import get_logger
 
 logger = get_logger(__name__)
 
-_client = Client(host=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
+
+def _client() -> Groq:
+    """Build a Groq client, failing clearly if no API key is set."""
+    if not settings.groq_api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. Add it to your .env file. "
+            "Get a free key at https://console.groq.com/keys"
+        )
+    return Groq(api_key=settings.groq_api_key)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
-def is_ollama_running() -> bool:
+def is_llm_available() -> bool:
+    """True if the LLM backend is reachable and the model is available."""
+    if not settings.groq_api_key:
+        logger.error("GROQ_API_KEY not configured")
+        return False
     try:
-        result = _client.list()
-        model_names = [m.model for m in result.models]
-        available = any(settings.ollama_model in name for name in model_names)
+        models = _client().models.list()
+        model_ids = [m.id for m in models.data]
+        available = settings.groq_model in model_ids
         if not available:
             logger.warning(
-                "LLaMA model not found in Ollama",
-                extra={"expected": settings.ollama_model, "available": model_names},
+                "Configured model not found on Groq",
+                extra={"expected": settings.groq_model, "available": model_ids},
             )
         return available
     except Exception as exc:
-        logger.error("Ollama server not reachable", extra={"error": str(exc)})
+        logger.error("Groq API not reachable", extra={"error": str(exc)})
         return False
 
 
-# ── Generate ──────────────────────────────────────────────────────────────────
+# Backwards-compatible alias (health endpoint / older callers).
+is_ollama_running = is_llm_available
 
+
+# ── Generate ──────────────────────────────────────────────────────────────────
 def generate(
     messages:    List[dict],
     temperature: float = settings.llm_temperature,
     max_tokens:  int   = settings.llm_max_tokens,
 ) -> str:
     """
-    Send a prompt to LLaMA and return the complete response as a string.
+    Send a prompt to LLaMA 3 (via Groq) and return the full response.
 
     Args:
         messages    : list of {"role": ..., "content": ...} dicts
@@ -61,52 +76,40 @@ def generate(
         The model's response as a plain string.
 
     Raises:
-        RuntimeError if Ollama is not running or the model is unavailable.
+        RuntimeError if the Groq API is unreachable or misconfigured.
     """
     try:
         logger.info(
-            "Calling LLaMA",
+            "Calling LLaMA via Groq",
             extra={
-                "model":       settings.ollama_model,
+                "model":       settings.groq_model,
                 "temperature": temperature,
                 "max_tokens":  max_tokens,
             },
         )
 
-        response = _client.chat(
-            model=settings.ollama_model,
+        response = _client().chat.completions.create(
+            model=settings.groq_model,
             messages=messages,
-            options={
-                "temperature": temperature,
-                "num_predict": max_tokens,
-            },
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
-        answer = response["message"]["content"].strip()
-        logger.info(
-            "LLaMA response received",
-            extra={"response_length": len(answer)},
-        )
+        answer = (response.choices[0].message.content or "").strip()
+        logger.info("LLaMA response received", extra={"response_length": len(answer)})
         return answer
 
-    except ResponseError as exc:
-        logger.error(
-            "Ollama API error",
-            extra={"error": str(exc)},
-        )
+    except GroqError as exc:
+        logger.error("Groq API error", extra={"error": str(exc)})
         raise RuntimeError(
-            f"Ollama error: {exc}. "
-            f"Make sure Ollama is running: ollama serve"
+            f"Groq error: {exc}. Check your GROQ_API_KEY and model name."
         ) from exc
 
     except Exception as exc:
-        logger.error(
-            "Unexpected LLM error",
-            extra={"error": str(exc)},
-        )
+        logger.error("Unexpected LLM error", extra={"error": str(exc)})
         raise RuntimeError(
-            "Could not connect to Ollama. "
-            "Run: ollama serve  and  ollama pull llama3:8b-instruct-q4_0"
+            "Could not reach the Groq API. "
+            "Set GROQ_API_KEY in .env (https://console.groq.com/keys)."
         ) from exc
 
 
@@ -116,35 +119,28 @@ def generate_stream(
     max_tokens:  int   = settings.llm_max_tokens,
 ) -> Generator[str, None, None]:
     """
-    Stream LLaMA tokens back one at a time as a generator.
-
-    Used by the Streamlit UI for a real-time typewriter effect.
+    Stream LLaMA 3 tokens back one at a time as a generator.
 
     Yields:
-        Individual token strings as they arrive from Ollama.
+        Individual token strings as they arrive from Groq.
 
     Usage:
         for token in generate_stream(messages):
             print(token, end="", flush=True)
     """
     try:
-        stream = _client.chat(
-            model=settings.ollama_model,
+        stream = _client().chat.completions.create(
+            model=settings.groq_model,
             messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
             stream=True,
-            options={
-                "temperature": temperature,
-                "num_predict": max_tokens,
-            },
         )
         for chunk in stream:
-            token = chunk["message"]["content"]
+            token = chunk.choices[0].delta.content
             if token:
                 yield token
 
     except Exception as exc:
-        logger.error(
-            "Streaming error",
-            extra={"error": str(exc)},
-        )
-        yield "\n\n[Error: Could not reach Ollama. Is it running?]"
+        logger.error("Streaming error", extra={"error": str(exc)})
+        yield "\n\n[Error: Could not reach the Groq API. Is GROQ_API_KEY set?]"

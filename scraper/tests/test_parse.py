@@ -55,6 +55,9 @@ MINIMAL_PDF_BYTES = (
     b"0000000360 00000 n \n"
     b"trailer\n<< /Size 6 /Root 1 0 R >>\n"
     b"startxref\n441\n%%EOF\n"
+    # Trailing comment padding (ignored by PDF readers) so the fixture
+    # exceeds download_pdf's 1KB "too small to be a real PDF" guard.
+    + b"%" + b" padding" * 60 + b"\n"
 )
 
 

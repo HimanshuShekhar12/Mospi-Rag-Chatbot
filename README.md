@@ -1,492 +1,319 @@
-# MoSPI Scraper + LLaMA RAG Chatbot
+# MoSPI Research Assistant — RAG Chatbot over Indian Government Statistics
 
-A production-quality data pipeline that scrapes statistical publications from the
-Ministry of Statistics and Programme Implementation (MoSPI), extracts text using
-Playwright browser automation, and powers a Retrieval-Augmented Generation (RAG)
-chatbot using a local LLaMA 3 model.
+A question-answering system built on the official publications of India's
+**Ministry of Statistics and Programme Implementation (MoSPI)**. It scrapes
+real statistical reports from `mospi.gov.in`, extracts their text, builds a
+searchable vector index, and answers questions using a **LLaMA 3** model —
+every answer backed by citations to the source document.
 
----
-
-## Table of Contents
-
-1. [Quick Start](#quick-start)
-2. [Project Structure](#project-structure)
-3. [Setup](#setup)
-4. [Running the Project](#running-the-project)
-5. [Architecture](#architecture)
-6. [Configuration](#configuration)
-7. [Testing](#testing)
-8. [API Reference](#api-reference)
-9. [Trade-offs & Design Decisions](#trade-offs--design-decisions)
-10. [Known Limits](#known-limits)
-11. [Future Improvements](#future-improvements)
+Ask *"What does the report say about labour market dynamics in million-plus
+cities?"* and get an answer grounded in the actual MoSPI PDF, with a link to it.
 
 ---
 
-## Quick Start
+## Contents
 
-```bash
-# 1. Clone and set up
-git clone https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant
-cd mospi-intelligence
-
-# 2. Configure
-cp .env.example .env        
-
-# 3. Start everything with Docker (recommended)
-docker compose up --build
-
-# 4. Run scraper (on demand — scrapes MoSPI pages via Playwright)
-docker compose --profile scraper run scraper
-
-# 5. Run ETL pipeline (validate → chunk → embed → index)
-docker compose --profile pipeline run pipeline
-```
-
-Open **http://localhost:8501** to use the chatbot.
+1. [How it works](#how-it-works)
+2. [Tech stack](#tech-stack)
+3. [Prerequisites](#prerequisites)
+4. [Setup](#setup)
+5. [Run it](#run-it)
+6. [Using the chatbot](#using-the-chatbot)
+7. [API reference](#api-reference)
+8. [Project structure](#project-structure)
+9. [Configuration](#configuration)
+10. [Testing](#testing)
+11. [Notes](#notes)
 
 ---
 
-## Project Structure
+## How it works
+
+The project is three stages: **scrape → index → ask.**
 
 ```
-mospi-intelligence/
-├── README.md
-├── Makefile
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-├── requirements.txt
-│
-├── scraper/
-│   ├── __init__.py
-│   ├── config.py
-│   ├── models.py
-│   ├── db.py
-│   ├── crawl.py
-│   ├── parse.py
-│   ├── report.py
-│   ├── utils.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── test_crawl.py
-│       ├── test_integration.py
-│       └── test_parse.py
-│
-├── pipeline/
-│   ├── __init__.py
-│   ├── catalog.py
-│   ├── chunker.py
-│   ├── embedder.py
-│   ├── indexer.py
-│   ├── run.py
-│   ├── validate.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── test_chunker.py
-│       └── test_validate.py
-│
-├── rag/
-│   ├── __init__.py
-│   ├── api.py
-│   ├── llm.py
-│   ├── prompt.py
-│   ├── retriever.py
-│   ├── ui/
-│   │   ├── __init__.py
-│   │   └── app.py
-│   └── tests/
-│       ├── __init__.py
-│       └── test_retriever.py
-│
-├── eval/
-│   ├── __init__.py
-│   ├── qa_pairs.json
-│   └── run_eval.py
-│
-└── infra/
-    ├── Dockerfile.api
-    ├── Dockerfile.scraper
-    └── Dockerfile.ui
+┌──────────────────────────────────────────────────────────────┐
+│  1. SCRAPE                                          scraper/  │
+│  ──────────                                                   │
+│  MoSPI is a JavaScript site backed by a JSON API.            │
+│  crawl.py calls that API, lists publications, downloads      │
+│  each PDF, and extracts its text with pdfplumber.            │
+│  → stored in SQLite (data/mospi.db)                          │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│  2. INDEX (ETL pipeline)                          pipeline/   │
+│  ──────────────────────                                       │
+│  validate → chunk (800–1200 tokens, overlapping)             │
+│           → embed (SentenceTransformers, all-MiniLM-L6-v2)   │
+│           → FAISS vector index (cosine similarity)           │
+│  → data/processed/faiss.index + chunks.pkl                  │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│  3. ASK (RAG chatbot)                                  rag/   │
+│  ─────────────────                                            │
+│  question → embed → FAISS top-k search → build prompt        │
+│          → LLaMA 3 (via Groq API) → answer + citations       │
+│  Served by FastAPI, with a Streamlit chat UI.               │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+**Query-time flow:**
+
+```
+User question
+   → embed_query()        (all-MiniLM-L6-v2)
+   → FAISS.search(k)      (cosine similarity)
+   → build_prompt()       (retrieved chunks + system prompt)
+   → LLaMA 3 via Groq
+   → Answer + Citations
+```
+
+---
+
+## Tech stack
+
+| Layer          | Technology                                             |
+|----------------|--------------------------------------------------------|
+| Scraping       | `requests` (MoSPI JSON API), `pdfplumber` (PDF text)   |
+| Storage        | SQLite                                                  |
+| Embeddings     | SentenceTransformers — `all-MiniLM-L6-v2` (384-dim)    |
+| Vector search  | FAISS (`IndexFlatIP`, exact cosine similarity)         |
+| LLM            | LLaMA 3 via the **Groq** API (`llama-3.1-8b-instant`)  |
+| Backend        | FastAPI                                                 |
+| Frontend       | Streamlit                                               |
+| Config         | Pydantic Settings (`.env`)                              |
+| Tests          | pytest (125 tests)                                      |
+
+---
+
+## Prerequisites
+
+- **Python 3.11+**
+- **A free Groq API key** — sign up at
+  [console.groq.com/keys](https://console.groq.com/keys) (no credit card).
+  This is what runs the LLaMA 3 model, so the project needs no GPU and no
+  local model download.
+
+That's it — no Docker, no Ollama, no browser drivers required.
 
 ---
 
 ## Setup
 
-### Prerequisites
+```powershell
+# 1. Clone
+git clone https://github.com/HimanshuShekhar12/Mospi-Rag-Chatbot
+cd Mospi-Rag-Chatbot
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Docker Desktop | latest | Containerised deployment (recommended) |
-| Python | 3.11+ | Runtime (for local dev only) |
-| Git | any | Version control |
-
-### Installation (Docker — Recommended)
-
-```bash
-# clone the repo
-git clone https://github.com/HimanshuShekhar12/MoSPI-Research-Assistant
-cd mospi-intelligence
-
-# copy config
-cp .env.example .env
-
-# build and start all services
-docker compose up --build
-```
-
-### Installation (Local Development)
-
-```bash
-# create virtual environment
+# 2. Create and activate a virtual environment
 python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac/Linux
+venv\Scripts\activate          # Windows (PowerShell)
+# source venv/bin/activate     # macOS / Linux
 
-# install dependencies
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# install Playwright browser
-playwright install chromium
-playwright install-deps chromium
+# 4. Create your config file
+copy .env.example .env         # Windows
+# cp .env.example .env         # macOS / Linux
+```
 
-# copy config template
-cp .env.example .env
+Then open `.env` and paste in your Groq API key:
+
+```
+GROQ_API_KEY=gsk_your_key_here
 ```
 
 ---
 
-## Running the Project
+## Run it
 
-### Option 1 — Docker (Recommended)
+You need the data indexed once, then two servers running (API + UI).
 
-```bash
-# Start all services (Ollama + FastAPI + Streamlit)
-docker compose up
+### Step 1 — Build the corpus (scrape + index)
 
-# Run scraper — visits MoSPI pages via Playwright and extracts text
-docker compose --profile scraper run scraper
+```powershell
+# Scrape MoSPI publications (downloads PDFs, extracts text into SQLite)
+python -m scraper.crawl --max-pages 6
 
-# Run ETL pipeline (validate → chunk → embed → index)
-docker compose --profile pipeline run pipeline
-```
-
-### Option 2 — Local (Development)
-
-```bash
-# Step 1 — Scrape MoSPI pages using Playwright
-python -m scraper.crawl --seed-url https://mospi.gov.in/press-releases --max-pages 5
-
-# Step 2 — View scraper summary
-python -m scraper.report
-
-# Step 3 — Run ETL pipeline (validate → chunk → embed → index)
+# Build the vector index (validate → chunk → embed → FAISS)
 python -m pipeline.run
+```
 
-# Step 4 — Start FastAPI backend
-uvicorn rag.api:app --host 0.0.0.0 --port 8000 --reload
+`--max-pages 6` fetches ~60 publications; raise it for a larger corpus.
 
-# Step 5 — Start Streamlit UI (new terminal)
+### Step 2 — Start the two servers
+
+Open **two terminals** (activate the venv in each):
+
+```powershell
+# Terminal 1 — FastAPI backend
+uvicorn rag.api:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 — Streamlit UI
 streamlit run rag/ui/app.py
-
-# Step 6 — Run quality evaluation
-python -m eval.run_eval
 ```
 
-### Option 3 — Make commands
+### Step 3 — Open the chatbot
 
-```bash
-make install    # install dependencies
-make crawl      # run scraper
-make etl        # full pipeline
-make api        # start FastAPI
-make ui         # start Streamlit
-make eval       # run evaluation
-make test       # run all tests
-make lint       # black + isort + mypy
-```
+Go to **http://localhost:8501** and start asking questions.
+
+> The backend API and its interactive docs are at http://localhost:8000/docs.
 
 ---
 
-## Architecture
+## Using the chatbot
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    MoSPI Website                        │
-│         mospi.gov.in/press-releases                     │
-└──────────────────────┬──────────────────────────────────┘
-                       │ Playwright (headless Chromium)
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                  Part A — Scraper                       │
-│                                                         │
-│  crawl.py    → Playwright browser scraping              │
-│              → text extracted from press release pages  │
-│              → saved to summary column in SQLite        │
-│  db.py       → SQLite (documents · files · tables)      │
-└──────────────────────┬──────────────────────────────────┘
-                       │ get_all_documents()
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                  Part B — Pipeline                      │
-│                                                         │
-│  validate.py → quality checks (title · date · url)      │
-│  chunker.py  → 800-1200 token overlapping chunks        │
-│              → reads from document summary column       │
-│  embedder.py → SentenceTransformers (all-MiniLM-L6-v2)  │
-│  indexer.py  → FAISS IndexFlatIP (cosine similarity)    │
-│  catalog.py  → datasets/catalog.json                    │
-└──────────────────────┬──────────────────────────────────┘
-                       │ faiss.index + chunks.pkl
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                  Part C — RAG Chatbot                   │
-│                                                         │
-│  retriever.py → embed query → FAISS top-k search        │
-│  prompt.py   → context window + system prompt           │
-│  llm.py      → Ollama (LLaMA 3 8B Instruct Q4)          │
-│  api.py      → FastAPI /ask /ingest /health             │
-│  ui/app.py   → Streamlit chat + citations + sliders     │
-└─────────────────────────────────────────────────────────┘
-```
+Open **http://localhost:8501**.
 
-### Data Flow at Query Time
+**Sidebar controls:**
 
-```
-User question
-     │
-     ▼
-embed_query()           ← all-MiniLM-L6-v2
-     │
-     ▼
-FAISS.search(k=5)       ← cosine similarity
-     │
-     ▼
-build_prompt()          ← context window + system prompt
-     │
-     ▼
-ollama.chat()           ← LLaMA 3 8B Instruct
-     │
-     ▼
-Answer + Citations      ← returned to UI
-```
+| Control              | What it does                                                        |
+|----------------------|--------------------------------------------------------------------|
+| **Number of sources (k)** | How many document chunks are retrieved to answer a question.  |
+| **Temperature**      | Answer randomness. `0.1` = factual and precise (recommended).      |
+| **Check Status**     | Shows whether the LLM backend and FAISS index are ready.          |
+| **Rebuild Index**    | Re-runs the ETL pipeline after new data is scraped.               |
+| **Clear Chat**       | Clears the conversation.                                           |
+
+**Tips**
+- Ask specific questions, e.g. *"What was the GDP growth rate in 2024-25?"*
+- Each answer lists its **cited sources** with relevance scores and links to
+  the original MoSPI PDF.
 
 ---
 
-## Configuration
+## API reference
 
-All settings are controlled via `.env`. See `.env.example` for full reference.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MOSPI_SEED_URLS` | mospi.gov.in/press-releases | Comma-separated crawl seeds |
-| `SCRAPER_MAX_PAGES` | 5 | Max listing pages per run |
-| `SCRAPER_DELAY_SECONDS` | 2.0 | Delay between requests |
-| `CHUNK_SIZE` | 1000 | Approximate tokens per chunk |
-| `CHUNK_OVERLAP` | 200 | Overlapping tokens between chunks |
-| `EMBEDDING_MODEL` | all-MiniLM-L6-v2 | SentenceTransformers model |
-| `OLLAMA_BASE_URL` | http://ollama:11434 | Ollama server URL (Docker service name) |
-| `OLLAMA_MODEL` | llama3:8b-instruct-q4_0 | LLaMA model name |
-| `LLM_TEMPERATURE` | 0.1 | Response randomness (0=factual) |
-| `RETRIEVAL_TOP_K` | 5 | Chunks retrieved per query |
-
----
-
-## Testing
-
-```bash
-# run all tests
-make test
-
-# run specific suites
-pytest scraper/tests/ -v        # scraper unit + integration tests
-pytest pipeline/tests/ -v       # pipeline tests
-pytest rag/tests/ -v            # RAG tests
-```
-
-### Test Coverage
-
-| Test File | Type | What It Tests |
-|-----------|------|---------------|
-| `test_crawl.py` | Unit | HTML parser, pagination, date/category normalisation |
-| `test_parse.py` | Unit | PDF hash, filename cleaning, text/table extraction |
-| `test_integration.py` | Integration | Full crawl → SQLite end to end with mock HTML |
-| `test_chunker.py` | Unit | Chunk sizes, overlap, lineage |
-| `test_validate.py` | Unit | Validation rules, deduplication |
-| `test_retriever.py` | Unit | Top-k returns correct number of results |
-
----
-
-## Using the Chatbot UI
-
-Open **http://localhost:8501** after starting all services.
-
-### Sidebar Controls
-
-| Control | What it does |
-|---------|-------------|
-| **Number of sources (k)** | How many document chunks are retrieved from FAISS to answer your question. Higher k = more context but slower response. Recommended: **2-3** on CPU. |
-| **Temperature** | Controls how creative/random LLaMA's answer is. `0.1` = factual and precise. `1.0` = more creative. Keep it low (`0.1`) for statistical data questions. |
-| **Check Status** | Shows whether Ollama (LLaMA model) and FAISS index are ready. Both should show ✅ before asking questions. |
-| **Rebuild Index** | Re-runs the ETL pipeline to refresh the vector index after new data is scraped. |
-| **Clear Chat** | Clears the conversation history. |
-
-### Tips
-- Keep **k=2** on CPU for faster responses (~30-60 seconds)
-- Ask specific questions like *"What was India's GDP growth in 2023-24?"* rather than broad ones
-- Each answer shows **cited sources** with relevance scores and links to original MoSPI pages
-
----
-
-## API Reference
-
-Base URL: `http://localhost:8000`
-
-Interactive docs: `http://localhost:8000/docs`
+Base URL: `http://localhost:8000` · Interactive docs: `/docs`
 
 ### `POST /ask`
 
-Ask a question from the MoSPI corpus.
-
-**Request:**
 ```json
-{
-  "question": "What was India's GDP growth rate in 2023-24?",
-  "k": 5,
-  "temperature": 0.1
-}
+{ "question": "What is India's GDP growth rate?", "k": 5, "temperature": 0.1 }
 ```
 
-**Response:**
+Response:
+
 ```json
 {
-  "answer": "India's GDP growth rate in 2023-24 was 8.2%...\n\nSources:\n• [GDP Press Note](https://mospi.gov.in/...)",
+  "answer": "India's GDP growth rate ...\n\nSources:\n• [Title](https://mospi.gov.in/...)",
   "citations": [
-    {
-      "rank": 1,
-      "score": 0.89,
-      "title": "GDP First Advance Estimate 2024-25",
-      "url": "https://mospi.gov.in/press-releases/gdp-q3-2024",
-      "category": "press-release",
-      "snippet": "The National Statistical Office releases..."
-    }
+    { "rank": 1, "score": 0.89, "title": "...", "url": "https://mospi.gov.in/...",
+      "category": "gdp", "snippet": "..." }
   ],
-  "question": "What was India's GDP growth rate in 2023-24?",
+  "question": "What is India's GDP growth rate?",
   "k_used": 5
 }
 ```
 
 ### `POST /ingest`
 
-Rebuild the vector index from current database.
-
-**Response:**
-```json
-{"status": "ok", "message": "Index rebuilt successfully."}
-```
+Rebuilds the FAISS index from the current database. Returns `{"status": "ok"}`.
 
 ### `GET /health`
 
-Check system status.
+Reports readiness: `{ "status": "ok", "ollama": true, "index": true, "n_vectors": 210 }`
+(the `ollama` field indicates the LLM backend is reachable.)
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "ollama": true,
-  "index": true,
-  "n_vectors": 187
-}
+---
+
+## Project structure
+
+```
+mospi-intelligence/
+├── scraper/                 # Part 1 — scrape MoSPI + extract PDF text
+│   ├── crawl.py             #   calls MoSPI's JSON API, downloads PDFs
+│   ├── parse.py             #   standalone PDF downloader + table extractor
+│   ├── db.py                #   SQLite layer (documents · files · tables)
+│   ├── models.py            #   Document / PDFFile / ExtractedTable dataclasses
+│   ├── config.py            #   Pydantic settings (reads .env)
+│   ├── utils.py             #   logging, rate limiting, text/date normalisation
+│   ├── report.py            #   prints a scrape run summary
+│   └── tests/               #   unit + integration tests
+│
+├── pipeline/                # Part 2 — ETL: validate → chunk → embed → index
+│   ├── validate.py          #   quality checks + deduplication
+│   ├── chunker.py           #   overlapping token chunks with doc lineage
+│   ├── embedder.py          #   SentenceTransformers embeddings
+│   ├── indexer.py           #   FAISS index build/load
+│   ├── catalog.py           #   writes datasets/catalog.json
+│   ├── run.py               #   pipeline entry point
+│   └── tests/
+│
+├── rag/                     # Part 3 — retrieval + chatbot
+│   ├── retriever.py         #   embed query → FAISS top-k search
+│   ├── prompt.py            #   builds the context window + citations
+│   ├── llm.py               #   LLaMA 3 client (Groq API)
+│   ├── api.py               #   FastAPI backend (/ask /ingest /health)
+│   ├── ui/app.py            #   Streamlit chat UI
+│   └── tests/
+│
+├── eval/                    # chatbot quality evaluation
+│   ├── qa_pairs.json
+│   └── run_eval.py
+│
+├── data/                    # SQLite DB + downloaded PDFs + FAISS index
+├── datasets/                # catalog.json
+├── infra/                   # Dockerfiles
+├── requirements.txt
+├── Makefile
+└── .env.example
 ```
 
 ---
 
-## Trade-offs & Design Decisions
+## Configuration
 
-### 1. Playwright over requests + BeautifulSoup
-MoSPI website blocks all direct HTTP requests with 403 Forbidden.
-Playwright runs a real headless Chromium browser, bypassing CDN/firewall protection.
-Trade-off: slower scraping, heavier Docker image (~500MB extra for Chromium).
-Benefit: actually works against JS-heavy and protected government websites.
+All settings live in `.env` (see `.env.example`). The common ones:
 
-### 2. Text scraping over PDF download
-MoSPI blocks direct PDF downloads server-side.
-Instead, press release text is scraped directly from the webpage and saved to the `summary` column in SQLite.
-Trade-off: less structured data than PDFs, no table extraction.
-Fix: combine with PDF download when URLs become accessible.
-
-### 3. SQLite over Postgres
-Chose SQLite for simplicity and zero infrastructure overhead.
-Trade-off: not suitable for concurrent writes at scale.
-Fix: swap `sqlite-utils` for `asyncpg` + Postgres when scaling.
-
-### 4. all-MiniLM-L6-v2 over larger models
-384-dimensional embeddings, 80MB model, very fast on CPU.
-Trade-off: slightly lower semantic accuracy than larger models like `bge-large`.
-Fix: swap `EMBEDDING_MODEL` in `.env` — no code changes needed.
-
-### 5. FAISS IndexFlatIP over HNSW
-Exact nearest neighbour search — guaranteed correct results.
-Trade-off: slower at very large scale (100k+ vectors).
-Fix: switch to `IndexHNSWFlat` for approximate search at scale.
-
-### 6. LLaMA 3 8B Q4 over full 70B
-4.7GB download, runs on CPU, good enough for factual Q&A.
-Trade-off: less nuanced reasoning than larger models, slow on CPU (~30-60s/response).
-Fix: change `OLLAMA_MODEL` in `.env` to `llama3:70b` on a GPU machine.
-
-### 7. Streamlit over Next.js
-Built in 150 lines, fully functional, looks professional.
-Trade-off: not a production frontend, limited customisation.
-Fix: replace with a React/Next.js app calling the same FastAPI endpoints.
+| Variable              | Default                    | Description                              |
+|-----------------------|----------------------------|------------------------------------------|
+| `GROQ_API_KEY`        | *(required)*               | Your Groq API key                        |
+| `GROQ_MODEL`          | `llama-3.1-8b-instant`     | LLaMA 3 model served by Groq             |
+| `SCRAPER_MAX_PAGES`   | `5`                        | Listing pages to fetch per crawl         |
+| `SCRAPER_DELAY_SECONDS` | `2.0`                    | Delay between requests                   |
+| `CHUNK_SIZE`          | `1000`                     | Approx. tokens per chunk                 |
+| `CHUNK_OVERLAP`       | `200`                      | Overlap between consecutive chunks       |
+| `EMBEDDING_MODEL`     | `all-MiniLM-L6-v2`         | SentenceTransformers model               |
+| `LLM_TEMPERATURE`     | `0.1`                      | Answer randomness (0 = factual)          |
+| `RETRIEVAL_TOP_K`     | `5`                        | Chunks retrieved per query               |
 
 ---
 
-## Known Limits
+## Testing
 
-- MoSPI website blocks all server-side HTTP and PDF download requests with 403 Forbidden. Playwright browser scraping is used as a fallback, which may timeout in Docker environments with slow networks.
-- Playwright scraping inside Docker requires Chromium to be installed in the container — adds ~500MB to image size and increases build time.
-- LLaMA on CPU is slow (~30-60 seconds per response). Fix: use a GPU or switch to a cloud API.
-- Only 4 chunks currently indexed due to limited scraped text. More data requires either fixing PDF access or scraping more pages.
-- `POST /ingest` is a blocking call — it runs the full pipeline synchronously. Fix: use a task queue (Celery / ARQ) for async indexing.
-- `qa_pairs.json` answers are generic — after scraping real data, update with actual values from the documents.
+```powershell
+# Run the full suite (125 tests)
+pytest scraper/tests/ pipeline/tests/ rag/tests/ -v
 
----
+# Or per component
+pytest scraper/tests/     # scraper: API parsing, PDF handling, integration
+pytest pipeline/tests/    # chunking + validation
+pytest rag/tests/         # retrieval
+```
 
-## Future Improvements
-
-- **More data** — fix MoSPI PDF access or scrape more pages for a richer corpus
-- **Airflow/Prefect DAG** — scheduled daily scraping with backfill support
-- **Great Expectations** — automated data quality reports
-- **Embedding cache** — skip re-embedding unchanged chunks
-- **Reranking** — cross-encoder reranker for better retrieval precision
-- **Grafana dashboard** — real-time metrics (docs/hour, error rate, latency)
-- **OCR support** — tesseract for scanned PDFs
-- **Async pipeline** — Celery task queue for non-blocking ingest
-- **GPU deployment** — faster LLaMA inference with CUDA support
+| Test file            | Covers                                                        |
+|----------------------|---------------------------------------------------------------|
+| `test_crawl.py`      | API item parsing, title cleaning, URL building, categories    |
+| `test_parse.py`      | PDF download, hashing, text + table extraction                |
+| `test_integration.py`| Full crawl → SQLite, end to end (HTTP mocked)                 |
+| `test_chunker.py`    | Chunk sizes, overlap, short-document handling                 |
+| `test_validate.py`   | Validation rules, deduplication                               |
+| `test_retriever.py`  | Top-k retrieval                                               |
 
 ---
 
-## What Worked
+## Notes
 
-- Playwright browser automation successfully bypassed MoSPI's 403 blocking
-- SentenceTransformers + FAISS gave good retrieval quality with minimal setup
-- Streamlit UI with source citations built in under 200 lines
-- Pydantic settings made configuration clean and validated
-- Docker Compose wired all 5 services together cleanly with one command
-
-## What Didn't Work
-
-- Direct HTTP requests to MoSPI were blocked with 403 Forbidden on all endpoints
-- Direct PDF downloads from MoSPI were blocked server-side
-- Playwright timed out on some pages inside Docker due to network restrictions
-- LLaMA response time on CPU is too slow for a real production chatbot
-
-## What I'd Do Next
-
-- Fix MoSPI PDF access for richer structured data
-- Add a task queue so `/ingest` is non-blocking
-- Deploy Ollama on a GPU machine for faster inference
-- Build a proper React frontend with WebSocket streaming
-- Add scheduled scraping with Airflow for fresh data daily
+- **The LLM runs on Groq's free API**, so responses are fast (~1–2s) and need
+  no GPU or local model. A `GROQ_API_KEY` in `.env` is required.
+- **Scraping uses MoSPI's public JSON API**, not browser automation — it's
+  fast and needs no browser drivers. Very large PDFs (>30 MB) and files with
+  no extractable text layer are skipped automatically.
+- **Embeddings download once.** The first run fetches the `all-MiniLM-L6-v2`
+  model (~80 MB) from Hugging Face; after that everything is local.
+- A Docker Compose file is included under `infra/`, but it targets the older
+  local-Ollama setup — the local run steps above are the maintained path.

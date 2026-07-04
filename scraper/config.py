@@ -42,7 +42,10 @@ class ScraperSettings(BaseSettings):
     faiss_index_path: str = Field(default="data/processed/faiss.index")
     chunks_pkl_path: str = Field(default="data/processed/chunks.pkl")
 
-    # LLaMA
+    # LLaMA 3 via Groq (free hosted API — no local Ollama/Docker needed)
+    groq_api_key: str = Field(default="")
+    groq_model: str = Field(default="llama-3.1-8b-instant")
+    # Legacy Ollama settings (kept for optional local/offline use)
     ollama_base_url: str = Field(default="http://localhost:11434")
     ollama_model: str = Field(default="llama3:8b-instruct-q4_0")
     llm_temperature: float = Field(default=0.1, ge=0.0, le=1.0)
